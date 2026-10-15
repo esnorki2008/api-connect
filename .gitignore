@@ -1,0 +1,15 @@
+/target
+
+# Datos locales de la app (pueden contener tokens, contraseñas y cookies)
+/collections.json
+/environments.json
+/settings.json
+/agents.json
+/cookies.json
+/repos/
+*.bak
+
+# Configuración local de herramientas
+.claude/settings.local.json
+.vscode/
+.idea/
