@@ -25,7 +25,25 @@ pub fn save<T: Serialize>(path: impl AsRef<Path>, value: &T) -> Result<(), Strin
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let json = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
-    std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, path)).map_err(|e| format!("{}: {e}", path.display()))
+    write_private(Path::new(&tmp), json.as_bytes()).and_then(|_| std::fs::rename(&tmp, path)).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Los JSON tienen tokens: en Unix solo los lee su dueño (0600). En Windows %APPDATA% ya es por usuario.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    std::io::Write::write_all(&mut o.open(path)?, bytes)
+}
+
+/// Crea la carpeta de datos; en Unix, solo accesible por su dueño (0700).
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+    b.create(dir)
 }
 
 /// Carpeta de datos. La actual si ya tiene datos de la app (modo portable, p. ej. junto al ejecutable);

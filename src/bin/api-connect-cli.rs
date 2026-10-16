@@ -482,7 +482,7 @@ fn import_into(dir: &std::path::Path, source: &str, keep_scripts: bool) -> Resul
         (read_source(source)?, None)
     };
     let (format, imported) = import::detect(&text, url)?;
-    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    storage::create_private_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let path = dir.join(COLLECTIONS);
     let mut cols: Vec<Collection> = storage::load(&path)?.unwrap_or_default();
     let msg = match imported {

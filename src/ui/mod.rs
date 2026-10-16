@@ -65,7 +65,7 @@ const AGENT_ROUNDS: u8 = 5; // rondas automáticas (acción -> resultado -> agen
 pub fn run() -> eframe::Result {
     // Instalada, la app arranca en cualquier carpeta: sus JSON van a la carpeta de datos del usuario.
     let dir = storage::data_dir();
-    if std::fs::create_dir_all(&dir).and_then(|_| std::env::set_current_dir(&dir)).is_err() {
+    if storage::create_private_dir(&dir).and_then(|_| std::env::set_current_dir(&dir)).is_err() {
         eprintln!("{}", tr!("No se pudo usar {}; los datos quedan en la carpeta actual.", "Could not use {}; data stays in the current folder.", dir.display()));
     }
     let options = eframe::NativeOptions {
