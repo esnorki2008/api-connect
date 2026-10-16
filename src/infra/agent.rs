@@ -8,9 +8,15 @@ use std::{
 
 use serde_json::{Value, json};
 
-use crate::model::{AgentCfg, err_chain};
+use crate::{
+    domain::model::AgentCfg,
+    i18n::{self, t},
+    infra::http::err_chain,
+    tr,
+};
 
-pub const SYSTEM: &str = "Eres el asistente de api-connect, un cliente HTTP de escritorio tipo Postman. Responde en español, breve y directo.
+pub const SYSTEM: &str = "Eres el agente de api-connect, un cliente de APIs REST \"agentic first\": todo lo que la persona hace en la app, lo puedes
+hacer tú con acciones. Responde en español, breve y directo; la persona ve tus mensajes y cada cambio que haces.
 Cuando escribas scripts, usa SOLO esta API (no existe require ni pm.iterationData; los scripts admiten await):
 - Variables con precedencia request > entorno > colección; en URL, headers y body se escriben como {{nombre}}.
   Dinámicas: {{$guid}} {{$timestamp}} {{$isoTimestamp}} {{$randomInt}}.
@@ -42,10 +48,39 @@ ejecuta en orden y te devuelve el resultado (y la respuesta HTTP si enviaste). A
 - {\"action\":\"create_environment\",\"name\":\"E\",\"values\":{...},\"activate\":true}
 - {\"action\":\"select_environment\",\"name\":\"E\"}
 - {\"action\":\"send\"}   envía el request abierto; recibes status, body y tests para seguir iterando
-campos = name, method, url, headers (texto \"Clave: Valor\" por línea u objeto), body (texto u objeto JSON), pre, tests.
+- {\"action\":\"import_openapi\",\"url\":\"https://.../openapi.json\"}  o  {\"action\":\"import_openapi\",\"spec\":\"texto YAML/JSON\"}
+     crea una colección con un request por endpoint (variable {{baseUrl}}, ejemplos de body y schema para validar)
+- {\"action\":\"run_collection\",\"collection\":\"C\",\"iterations\":1}   corre todos sus requests en orden con sus tests;
+     recibes el resumen y los fallos
+- {\"action\":\"create_battery\",\"name\":\"B\",\"description\":\"...\",\"stages\":[{\"vus\":20,\"secs\":10,\"ramp\":true},{\"vus\":20,\"secs\":60}]}
+     guarda una batería de estrés reutilizable (vus 1..500 usuarios virtuales, secs 1..3600; ramp = subir en línea recta)
+- {\"action\":\"run_stress\",\"collection\":\"C\",\"request\":\"opcional R\",\"setup\":\"opcional login\",\"battery\":\"B\"}
+     o con \"stages\":[...] en lugar de battery. SIEMPRE pide aprobación. Recibes por etapa y endpoint: n, % de error,
+     req/s, p50/p95/p99/max en ms y códigos HTTP. setup se envía una vez antes de medir (p. ej. el login que guarda el token).
+     Sin request, estresa toda la colección menos el setup. En estrés no corren los tests.
+Solo una acción que ejecuta (run_collection, run_stress o import_openapi) por respuesta: espera su resultado antes de seguir.
+- {\"action\":\"set_collection_auth\",\"collection\":\"C\",\"auth\":{auth}}   auth que heredan sus requests
+campos = name, method, url, headers (texto \"Clave: Valor\" por línea u objeto), body (texto u objeto JSON), pre, tests, auth.
+auth = {\"type\":\"inherit\"|\"none\"} | {\"type\":\"bearer\",\"token\":\"{{token}}\"} | {\"type\":\"basic\",\"user\":\"..\",\"pass\":\"{{pass}}\"}
+  | {\"type\":\"api_key\",\"key\":\"X-Api-Key\",\"value\":\"{{key}}\",\"in_query\":false}
+  | {\"type\":\"oauth2\",\"grant\":\"client_credentials\"|\"password\"|\"authorization_code\",\"token_url\":\"..\",\"auth_url\":\"..\",
+     \"client_id\":\"{{client_id}}\",\"client_secret\":\"{{client_secret}}\",\"scope\":\"..\"}  (el token se obtiene solo al enviar).
+  Los secretos van SIEMPRE como {{variables}}; tú no ves sus valores.
+Escribir scripts (pre o tests) o cambiar una auth siempre pide aprobación al usuario: tocan sus secretos.
 Reglas: los requests que vienen de un CONTRATO (openapi del repo) se editan solo como versión del usuario; el contrato es
 de solo lectura. Respeta el schema del contrato salvo que el usuario pida lo contrario. Usa {{variables}} en lugar de
-valores sensibles. Haz solo lo que el usuario pidió y explica en una línea qué vas a hacer antes del bloque.";
+valores sensibles. Haz solo lo que el usuario pidió y explica en una línea qué vas a hacer antes del bloque. Para pruebas de estrés, propón
+una batería acorde a lo pedido (humo antes que carga) y, al recibir los resultados, interpreta latencias y errores en
+lenguaje claro: qué endpoint se degrada, desde cuántos usuarios y qué revisar.";
+
+/// SYSTEM más el idioma en que debe responder (el de la interfaz).
+pub fn system_prompt() -> String {
+    let lang = if i18n::en() { "English" } else { "español" };
+    tr!(
+        "{SYSTEM}\nIDIOMA: responde SIEMPRE en {lang} (el idioma de la interfaz), aunque el contexto esté en otro idioma.",
+        "{SYSTEM}\nLANGUAGE: ALWAYS reply in {lang} (the UI language), even if the context is in another language.",
+    )
+}
 
 /// messages: (rol, contenido) con rol "user" | "assistant". Bloquea: llamar desde un hilo de trabajo.
 pub fn ask(
@@ -57,12 +92,12 @@ pub fn ask(
     // El modelo llega como argumento de proceso: sin esto, "--algo" se colaría como flag de claude.
     let m = &a.model;
     if m.is_empty() || m.starts_with('-') || !m.chars().all(|c| c.is_ascii_alphanumeric() || "._:-/".contains(c)) {
-        return Err(format!("modelo inválido: {m:?}"));
+        return Err(tr!("modelo inválido: {m:?}", "invalid model: {m:?}"));
     }
     match a.kind.as_str() {
         "claude" => claude(a, messages, claude_timeout),
         "ollama" => ollama(client, a, messages),
-        k => Err(format!("tipo de agente desconocido: {k:?} (usa claude u ollama)")),
+        k => Err(tr!("tipo de agente desconocido: {k:?} (usa claude u ollama)", "unknown agent kind: {k:?} (use claude or ollama)")),
     }
 }
 
@@ -71,28 +106,35 @@ pub fn ask(
 fn claude(a: &AgentCfg, messages: &[(String, String)], timeout: Duration) -> Result<String, String> {
     let effort = if a.effort.is_empty() { "low" } else { &a.effort };
     if !["low", "medium", "high", "xhigh", "max"].contains(&effort) {
-        return Err(format!("effort inválido: {effort:?}"));
+        return Err(tr!("effort inválido: {effort:?}", "invalid effort: {effort:?}"));
     }
     let prompt = messages
         .iter()
-        .map(|(role, content)| format!("{}:\n{content}", if role == "assistant" { "Asistente" } else { "Usuario" }))
+        .map(|(role, content)| format!("{}:\n{content}", if role == "assistant" { t("Asistente", "Assistant") } else { t("Usuario", "User") }))
         .collect::<Vec<_>>()
         .join("\n\n");
 
     let mut cmd = Command::new("claude");
     cmd.args(["-p", "--output-format", "json", "--tools", "", "--strict-mcp-config", "--no-session-persistence"])
         .args(["--disable-slash-commands", "--setting-sources", "local"])
-        .args(["--model", &a.model, "--effort", effort, "--system-prompt", SYSTEM])
+        .args(["--model", &a.model, "--effort", effort, "--system-prompt", &system_prompt()])
         .current_dir(std::env::temp_dir());
     let (stdout, stderr) = run_with_timeout(cmd, &prompt, timeout).map_err(|e| match e {
-        RunError::Spawn(e) => format!("no se pudo ejecutar claude (¿está en el PATH?): {e}"),
-        RunError::Timeout => format!("claude no respondió en {} s. Ajusta el timeout en Agente → Configurar.", timeout.as_secs()),
+        RunError::Spawn(e) => tr!(
+            "no se pudo ejecutar claude (¿está en el PATH?): {e}. Instala Claude Code e inicia sesión con `claude`, o elige Ollama en Configurar.",
+            "could not run claude (is it on the PATH?): {e}. Install Claude Code and sign in with `claude`, or pick Ollama in Configure.",
+        ),
+        RunError::Timeout => tr!(
+            "claude no respondió en {} s. Ajusta el timeout en Agente → Configurar.",
+            "claude did not answer within {} s. Adjust the timeout in Agent → Configure.",
+            timeout.as_secs()
+        ),
         RunError::Io(e) => e,
     })?;
 
     let v: Value = serde_json::from_slice(&stdout).map_err(|_| {
         let err = String::from_utf8_lossy(if stderr.is_empty() { &stdout } else { &stderr });
-        format!("claude falló: {}", err.trim())
+        tr!("claude falló: {}", "claude failed: {}", err.trim())
     })?;
     let result = v["result"].as_str().unwrap_or_default().to_string();
     if v["is_error"].as_bool().unwrap_or(false) {
@@ -144,7 +186,7 @@ fn run_with_timeout(mut cmd: Command, input: &str, timeout: Duration) -> Result<
 
 fn ollama(client: &reqwest::blocking::Client, a: &AgentCfg, messages: &[(String, String)]) -> Result<String, String> {
     let base = if a.url.is_empty() { "http://127.0.0.1:11434" } else { a.url.trim_end_matches('/') };
-    let mut msgs = vec![json!({ "role": "system", "content": SYSTEM })];
+    let mut msgs = vec![json!({ "role": "system", "content": system_prompt() })];
     msgs.extend(messages.iter().map(|(role, content)| json!({ "role": role, "content": content })));
     let res = client
         .post(format!("{base}/api/chat"))
@@ -200,7 +242,7 @@ mod tests {
     #[test]
     fn rejects_flag_like_models() {
         let a = AgentCfg { name: "x".into(), kind: "claude".into(), model: "--dangerously-skip-permissions".into(), effort: "".into(), url: "".into() };
-        assert!(ask(&crate::model::client(), &a, &[], Duration::from_secs(1)).unwrap_err().contains("modelo inválido"));
+        assert!(ask(&crate::infra::http::client(), &a, &[], Duration::from_secs(1)).unwrap_err().contains("modelo inválido"));
     }
 
     /// Llama a Claude Haiku de verdad (consume cuota): `cargo test --release -- --ignored haiku`
@@ -210,13 +252,30 @@ mod tests {
         let a = AgentCfg { name: "h".into(), kind: "claude".into(), model: "claude-haiku-5-5".into(), effort: "low".into(), url: "".into() };
         let q = "Crea la colección \"Demo\" con un request \"Ping\" GET a {{base}}/ping que tenga un test de status 200, \
                  crea el entorno \"qa\" con base=http://localhost:9 y actívalo, y envía el request.\n\n---\nContexto:\nColecciones: (ninguna)\nEntornos: (ninguno)";
-        let reply = ask(&crate::model::client(), &a, &[("user".into(), q.into())], Duration::from_secs(120)).unwrap();
-        let acts = crate::actions::extract(&reply);
+        let reply = ask(&crate::infra::http::client(), &a, &[("user".into(), q.into())], Duration::from_secs(120)).unwrap();
+        let acts = crate::domain::actions::extract(&reply);
         println!("{reply}\n{acts:#?}");
         assert!(!acts.is_empty() && acts.iter().all(Result::is_ok), "acciones inválidas: {acts:?}");
         let acts: Vec<_> = acts.into_iter().map(Result::unwrap).collect();
-        assert!(acts.iter().any(|x| matches!(x, crate::actions::Action::CreateRequest { .. })));
-        assert!(acts.iter().any(|x| matches!(x, crate::actions::Action::CreateEnvironment { .. })));
+        assert!(acts.iter().any(|x| matches!(x, crate::domain::actions::Action::CreateRequest { .. })));
+        assert!(acts.iter().any(|x| matches!(x, crate::domain::actions::Action::CreateEnvironment { .. })));
+    }
+
+    /// Igual que el anterior, para pruebas de estrés: `cargo test --release -- --ignored haiku`
+    #[test]
+    #[ignore]
+    fn haiku_plans_stress_tests() {
+        let a = AgentCfg { name: "h".into(), kind: "claude".into(), model: "claude-haiku-5-5".into(), effort: "low".into(), url: "".into() };
+        let q = "Prepara una prueba de carga sobre Tienda / Listar: rampa a 20 usuarios en 10 s y luego 1 minuto sostenido, \
+                 con Login como preparación. Guárdala como batería para reusarla y córrela.\n\n---\nContexto:\nColecciones:\n- Tienda (2 requests)\n    POST Login\n    GET Listar\n\
+                 Baterías de estrés: Humo (1 VUs·10 s); Carga (rampa→10 VUs·15 s → 10 VUs·60 s)";
+        let reply = ask(&crate::infra::http::client(), &a, &[("user".into(), q.into())], Duration::from_secs(120)).unwrap();
+        let acts = crate::domain::actions::extract(&reply);
+        println!("{reply}\n{acts:#?}");
+        assert!(!acts.is_empty() && acts.iter().all(Result::is_ok), "acciones inválidas: {acts:?}");
+        use crate::domain::actions::Action;
+        assert!(acts.iter().flatten().any(|x| matches!(x, Action::CreateBattery { stages, .. } if stages.len() == 2)));
+        assert!(acts.iter().flatten().any(|x| matches!(x, Action::RunStress { setup: Some(s), .. } if s == "Login")));
     }
 
     #[cfg(windows)]

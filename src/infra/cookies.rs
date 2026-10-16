@@ -56,7 +56,7 @@ pub fn take_dirty() -> bool {
 }
 
 fn now() -> i64 {
-    crate::auth::now() as i64
+    crate::infra::auth::now() as i64
 }
 
 /// Valor del header Cookie para esta URL, si hay alguna.

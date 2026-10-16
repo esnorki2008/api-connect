@@ -1,132 +1,13 @@
-//! Importa un comando cURL a un request, o una colección de Postman v2.x a una colección.
+//! Importa una colección de Postman v2.x.
 
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use serde_json::Value;
 
-use crate::model::{Collection, Request};
-
-fn tokenize(s: &str) -> Vec<String> {
-    let s = s.replace("\\\r\n", " ").replace("\\\n", " ");
-    let c: Vec<char> = s.chars().collect();
-    let (mut out, mut cur, mut i) = (Vec::new(), None::<String>, 0);
-    while i < c.len() {
-        if c[i].is_whitespace() {
-            out.extend(cur.take());
-            i += 1;
-            continue;
-        }
-        let t = cur.get_or_insert_with(String::new);
-        match c[i] {
-            '\'' => {
-                i += 1;
-                while i < c.len() && c[i] != '\'' {
-                    t.push(c[i]);
-                    i += 1;
-                }
-                i += 1;
-            }
-            '"' => {
-                i += 1;
-                while i < c.len() && c[i] != '"' {
-                    if c[i] == '\\' && i + 1 < c.len() && "\"\\$`".contains(c[i + 1]) {
-                        i += 1;
-                    }
-                    t.push(c[i]);
-                    i += 1;
-                }
-                i += 1;
-            }
-            '\\' if i + 1 < c.len() => {
-                t.push(c[i + 1]);
-                i += 2;
-            }
-            ch => {
-                t.push(ch);
-                i += 1;
-            }
-        }
-    }
-    out.extend(cur);
-    out
-}
-
-pub fn parse_curl(cmd: &str) -> Result<Request, String> {
-    let mut cmd = cmd.trim().to_string();
-    // "Copy as cURL (cmd)" de Chrome escapa todo con ^
-    if cmd.contains("^\"") {
-        let joined = cmd.replace("^\r\n", " ").replace("^\n", " ");
-        let mut chars = joined.chars();
-        cmd = std::iter::from_fn(|| chars.next().map(|c| if c == '^' { chars.next().unwrap_or('^') } else { c }))
-            .collect();
-    }
-    let t = tokenize(&cmd);
-    if t.first().map(String::as_str) != Some("curl") {
-        return Err("El comando debe empezar con curl".into());
-    }
-    let (mut method, mut url, mut form) = (String::new(), String::new(), false);
-    let (mut headers, mut data) = (Vec::<String>::new(), Vec::<String>::new());
-    let mut i = 1;
-    while i < t.len() {
-        let a = &t[i];
-        let (flag, inline) = if a.starts_with("--") && a.contains('=') {
-            let (f, v) = a.split_once('=').unwrap();
-            (f.to_string(), Some(v.to_string()))
-        } else if a.len() > 2 && !a.starts_with("--") && a.starts_with('-') && a.chars().nth(1).is_some_and(|c| "XHduAbe".contains(c)) {
-            (a[..2].to_string(), Some(a[2..].to_string()))
-        } else {
-            (a.clone(), None)
-        };
-        let mut val = || match &inline {
-            Some(v) => v.clone(),
-            None => {
-                i += 1;
-                t.get(i).cloned().unwrap_or_default()
-            }
-        };
-        match flag.as_str() {
-            "-X" | "--request" => method = val().to_uppercase(),
-            "-H" | "--header" => headers.push(val()),
-            "-d" | "--data" | "--data-raw" | "--data-binary" | "--data-ascii" => {
-                data.push(val());
-                form = true;
-            }
-            "--data-urlencode" => {
-                let x = val();
-                let enc = |s: &str| form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
-                data.push(match x.split_once('=') {
-                    Some((k, v)) => format!("{k}={}", enc(v)),
-                    None => enc(&x),
-                });
-                form = true;
-            }
-            "--json" => {
-                data.push(val());
-                headers.push("Content-Type: application/json".into());
-                headers.push("Accept: application/json".into());
-            }
-            "-u" | "--user" => headers.push(format!("Authorization: Basic {}", B64.encode(val()))),
-            "-A" | "--user-agent" => headers.push(format!("User-Agent: {}", val())),
-            "-b" | "--cookie" => headers.push(format!("Cookie: {}", val())),
-            "-e" | "--referer" => headers.push(format!("Referer: {}", val())),
-            "-I" | "--head" => method = "HEAD".into(),
-            "--url" => url = val(),
-            "-o" | "--output" | "-m" | "--max-time" | "--connect-timeout" | "-w" | "--write-out" | "-x" | "--proxy"
-            | "--cacert" | "--cert" | "--key" => {
-                val();
-            }
-            f if !f.starts_with('-') => url = f.to_string(),
-            _ => {} // -s, -L, -k, --compressed, etc.
-        }
-        i += 1;
-    }
-    if form && !headers.iter().any(|h| h.to_lowercase().starts_with("content-type:")) {
-        headers.push("Content-Type: application/x-www-form-urlencoded".into());
-    }
-    if method.is_empty() {
-        method = if data.is_empty() { "GET" } else { "POST" }.into();
-    }
-    Ok(Request { method, url, headers: headers.join("\n"), body: data.join("&"), ..Default::default() })
-}
+use crate::{
+    domain::model::{Collection, Request},
+    i18n::t,
+    tr,
+};
 
 fn text(v: &Value) -> String {
     match v {
@@ -237,43 +118,20 @@ fn walk(items: &[Value], prefix: &str, auth: &Value, pre: &str, tests: &str, out
 }
 
 pub fn import_postman(json: &str) -> Result<Collection, String> {
-    let c: Value = serde_json::from_str(json).map_err(|e| format!("JSON inválido: {e}"))?;
-    let items = c["item"].as_array().filter(|_| c["info"].is_object()).ok_or("No parece una colección de Postman v2.x")?;
+    let c: Value = serde_json::from_str(json).map_err(|e| tr!("JSON inválido: {e}", "invalid JSON: {e}"))?;
+    let items = c["item"].as_array().filter(|_| c["info"].is_object()).ok_or(t("No parece una colección de Postman v2.x", "It does not look like a Postman v2.x collection"))?;
     let mut requests = Vec::new();
     walk(items, "", &c["auth"], &script_of(&c["event"], "prerequest"), &script_of(&c["event"], "test"), &mut requests);
     let variables = c["variable"]
         .as_array()
         .map(|vs| vs.iter().filter_map(|v| Some((v["key"].as_str().filter(|k| !k.is_empty())?.to_string(), text(&v["value"])))).collect())
         .unwrap_or_default();
-    Ok(Collection { name: c["info"]["name"].as_str().unwrap_or("Importada").to_string(), variables, requests, ..Default::default() })
+    Ok(Collection { name: c["info"]["name"].as_str().unwrap_or(t("Importada", "Imported")).to_string(), variables, requests, ..Default::default() })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn curl_bash() {
-        let r = parse_curl(
-            "curl 'https://api.x/u' -H 'Content-Type: application/json' \\\n  -H \"Authorization: Bearer \\\"t\\\"\" --data-raw '{\"a\":1}' --compressed",
-        )
-        .unwrap();
-        assert_eq!((r.method.as_str(), r.url.as_str()), ("POST", "https://api.x/u"));
-        assert_eq!(r.headers, "Content-Type: application/json\nAuthorization: Bearer \"t\"");
-        assert_eq!(r.body, r#"{"a":1}"#);
-    }
-
-    #[test]
-    fn curl_short_flags_and_cmd() {
-        let r = parse_curl("curl -XDELETE -u user:pass https://api.x/u/1").unwrap();
-        assert_eq!(r.method, "DELETE");
-        assert_eq!(r.headers, format!("Authorization: Basic {}", B64.encode("user:pass")));
-        let r = parse_curl(r#"curl ^"https://api.x/q^" -H ^"Accept: */*^" --data-urlencode ^"q=a b^""#).unwrap();
-        assert_eq!(r.url, "https://api.x/q");
-        assert_eq!(r.body, "q=a+b");
-        assert!(r.headers.contains("x-www-form-urlencoded"));
-        assert!(parse_curl("wget x").is_err());
-    }
 
     #[test]
     fn postman_collection() {

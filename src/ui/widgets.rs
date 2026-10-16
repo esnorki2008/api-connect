@@ -1,6 +1,8 @@
-//! Piezas de UI reutilizables: resaltado de sintaxis, tablas clave/valor (como en Postman) y etiquetas.
+//! Piezas de UI reutilizables: resaltado de sintaxis, tablas clave/valor y etiquetas.
 
 use std::sync::Arc;
+
+use crate::i18n;
 
 use eframe::egui::{
     self, Color32, FontId, Galley, RichText, TextEdit, TextStyle, Ui,
@@ -10,7 +12,7 @@ use eframe::egui::{
 // Colores de sintaxis del tema activo (Atom One Dark / One Light).
 #[allow(non_snake_case)]
 mod c {
-    pub use crate::theme::{
+    pub use crate::ui::theme::{
         cyan as CYAN, syn_comment as COMMENT, syn_fn as FUNC, syn_key as KEY, syn_kw as KW, syn_num as NUM, syn_punct as PUNCT, syn_str as STR,
         text as TEXT, var_bg as VAR_BG, warn as VAR,
     };
@@ -179,7 +181,7 @@ type HighlightCache = egui::cache::FrameCache<LayoutJob, Highlighter>;
 /// Layouter para TextEdit: colorea con caché (solo se recalcula cuando cambia el texto).
 pub fn layouter(lang: Lang, size: f32) -> impl FnMut(&Ui, &str, f32) -> Arc<Galley> {
     move |ui, text, wrap| {
-        let mut job = ui.ctx().memory_mut(|m| m.caches.cache::<HighlightCache>().get((text, lang, (size * 10.0) as u32, crate::theme::is_light())));
+        let mut job = ui.ctx().memory_mut(|m| m.caches.cache::<HighlightCache>().get((text, lang, (size * 10.0) as u32, crate::ui::theme::is_light())));
         job.wrap.max_width = wrap;
         ui.fonts(|f| f.layout_job(job))
     }
@@ -228,7 +230,7 @@ impl Row {
     }
 }
 
-/// Tabla estilo Postman; siempre deja una fila vacía al final para agregar. Devuelve true si cambió algo.
+/// Tabla clave/valor; siempre deja una fila vacía al final para agregar. Devuelve true si cambió algo.
 pub fn kv_table(ui: &mut Ui, id: &str, rows: &mut Vec<Row>, toggles: bool, hints: (&str, &str)) -> bool {
     if rows.last().is_none_or(|r| !r.key.is_empty() || !r.value.is_empty()) {
         rows.push(Row::empty());
@@ -249,8 +251,8 @@ pub fn kv_table(ui: &mut Ui, id: &str, rows: &mut Vec<Row>, toggles: bool, hints
                     ui.label(RichText::new(t).small().color(COMMENT()));
                 });
             };
-            head(ui, key_w, "CLAVE");
-            head(ui, val_w, "VALOR");
+            head(ui, key_w, i18n::t("CLAVE", "KEY"));
+            head(ui, val_w, i18n::t("VALOR", "VALUE"));
         });
         for (i, r) in rows.iter_mut().enumerate() {
             let last = i + 1 == n;
@@ -259,7 +261,7 @@ pub fn kv_table(ui: &mut Ui, id: &str, rows: &mut Vec<Row>, toggles: bool, hints
                     if last {
                         ui.add_space(check_w);
                     } else {
-                        changed |= ui.add_sized([check_w - 4.0, 22.0], egui::Checkbox::without_text(&mut r.on)).on_hover_text("Incluir en el envío").changed();
+                        changed |= ui.add_sized([check_w - 4.0, 22.0], egui::Checkbox::without_text(&mut r.on)).on_hover_text(i18n::t("Incluir en el envío", "Include when sending")).changed();
                     }
                 }
                 let dim = !r.on && !last;
@@ -268,7 +270,7 @@ pub fn kv_table(ui: &mut Ui, id: &str, rows: &mut Vec<Row>, toggles: bool, hints
                 let mut lay = line_layouter(Lang::Plain, 13.5);
                 let val = TextEdit::singleline(&mut r.value).font(TextStyle::Monospace).hint_text(if last { hints.1 } else { "" }).layouter(&mut lay);
                 changed |= ui.add(val.desired_width(val_w)).changed();
-                if !last && ui.small_button("×").on_hover_text("Quitar").clicked() {
+                if !last && ui.small_button("×").on_hover_text(i18n::t("Quitar", "Remove")).clicked() {
                     remove = Some(i);
                 }
             });

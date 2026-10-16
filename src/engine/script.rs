@@ -5,8 +5,12 @@ use boa_engine::{Context, JsArgs, JsResult, JsString, JsValue, NativeFunction, S
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-pub use crate::model::ReqParts;
-use crate::model::{self, Response, Vars};
+pub use crate::domain::model::ReqParts;
+use crate::{
+    domain::{model::Response, vars::Vars},
+    infra::http,
+    tr,
+};
 
 #[derive(Clone, Default, Debug)]
 pub struct Scopes {
@@ -18,7 +22,7 @@ pub struct Scopes {
 }
 
 impl Scopes {
-    /// Precedencia como en Postman: request (local) > datos de la iteración > entorno > colección.
+    /// Precedencia: request (local) > datos de la iteración > entorno > colección.
     pub fn merged(&self) -> Vars {
         let mut v = self.collection.clone();
         v.extend(self.env.clone());
@@ -96,7 +100,7 @@ pub fn run(code: &str, scopes: &mut Scopes, req: &mut ReqParts, resp: Option<&Re
             *req = o.request;
             Outcome { tests: o.tests, error: o.error, logs: o.logs, next: o.next.map(|n| n.name) }
         }
-        Err(e) => Outcome { error: Some(format!("salida inválida del script: {e}")), ..Default::default() },
+        Err(e) => Outcome { error: Some(tr!("salida inválida del script: {e}", "invalid script output: {e}")), ..Default::default() },
     }
 }
 
@@ -112,16 +116,16 @@ fn http_native(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsV
     }
     let input = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
     let out = match serde_json::from_str::<In>(&input) {
-        Ok(r) => match model::send_http(&model::client(), &r.method, &r.url, &r.headers, &r.body) {
+        Ok(r) => match http::send_http(&http::client(), &r.method, &r.url, &r.headers, &r.body) {
             Ok(resp) => json!({ "response": resp }),
             Err(e) => json!({ "error": e }),
         },
-        Err(e) => json!({ "error": format!("pm.sendRequest: petición inválida: {e}") }),
+        Err(e) => json!({ "error": tr!("pm.sendRequest: petición inválida: {e}", "pm.sendRequest: invalid request: {e}") }),
     };
     Ok(JsValue::from(JsString::from(out.to_string().as_str())))
 }
 
-/// Subconjunto de la API pm.* de Postman. Es JavaScript porque corre dentro de Boa junto al script del usuario.
+/// API pm.* de scripts (compatible con la de colecciones importadas). Es JavaScript porque corre dentro de Boa junto al script del usuario.
 const PRELUDE: &str = r#"
 let __finish;
 function __run(ctx, code) {
@@ -178,7 +182,7 @@ function __run(ctx, code) {
     return a;
   }
 
-  // pm.request: url/method como string, headers con la API de Postman, body como string o {raw, update()}.
+  // pm.request: url/method como string, headers con la API pm.*, body como string o {raw, update()}.
   const r = ctx.request;
   const list = r.headers.split('\n').map(l => {
     const i = l.indexOf(':');
@@ -212,7 +216,7 @@ function __run(ctx, code) {
   const response = ctx.response ? makeResponse(ctx.response) : undefined;
 
   // pm.sendRequest(url | {url, method, header, body}, (err, res) => …) o como promesa (.then / await).
-  // Como en Postman, no resuelve {{vars}} solo: usa pm.variables.replaceIn(...).
+  // No resuelve {{vars}} solo: usa pm.variables.replaceIn(...).
   const toReq = q => {
     if (typeof q === 'string') return { method: 'GET', url: q, headers: [], body: '' };
     const h = q.header || q.headers;

@@ -1,4 +1,4 @@
-//! Runner de colecciones (como Newman) y baterías de estrés con estadísticas por endpoint.
+//! Runner de colecciones y baterías de estrés con estadísticas por endpoint.
 
 use std::{
     collections::BTreeMap,
@@ -7,11 +7,17 @@ use std::{
 };
 
 use reqwest::blocking::Client;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::{
-    model::{self, Collection, Request, Response, Vars, parse_headers, resolve},
-    script::{self, Outcome, ReqParts, Scopes, TestResult},
+    domain::{
+        model::{self, Collection, MAX_VUS, Request, Response, Stage},
+        vars::{Vars, parse_headers, resolve},
+    },
+    engine::script::{self, Outcome, ReqParts, Scopes, TestResult},
+    i18n::t,
+    infra::http,
+    tr,
 };
 
 pub struct SendDone {
@@ -43,7 +49,7 @@ pub fn run_send(client: &Client, ed: &Request, mut scopes: Scopes) -> SendDone {
     let vars = scopes.merged();
     // La auth se aplica después del pre-request (que puede haber fijado el token) y entra en `req`,
     // así el estrés reutiliza el request ya autorizado.
-    let result = crate::auth::apply(client, &ed.auth, &mut req, &vars).and_then(|_| send_parts(client, &req, &vars));
+    let result = crate::infra::auth::apply(client, &ed.auth, &mut req, &vars).and_then(|_| send_parts(client, &req, &vars));
     let mut d = SendDone { scopes, req, result, tests: Vec::new(), logs: Vec::new(), next: None };
     collect(pre, "Pre-request", &mut d);
     if let Ok(r) = &d.result {
@@ -55,7 +61,7 @@ pub fn run_send(client: &Client, ed: &Request, mut scopes: Scopes) -> SendDone {
 
 fn send_parts(client: &Client, req: &ReqParts, vars: &Vars) -> Result<Response, String> {
     let r = |s: &str| resolve(s, vars);
-    model::send_http(client, &req.method, &r(&req.url), &parse_headers(&r(&req.headers)), &r(&req.body))
+    http::send_http(client, &req.method, &r(&req.url), &parse_headers(&r(&req.headers)), &r(&req.body))
 }
 
 // ---- Archivos de datos ----
@@ -64,7 +70,7 @@ fn send_parts(client: &Client, req: &ReqParts, vars: &Vars) -> Result<Response, 
 pub fn parse_data(text: &str) -> Result<Vec<Vars>, String> {
     let text = text.trim_start_matches('\u{feff}');
     if text.trim_start().starts_with('[') {
-        let rows: Vec<serde_json::Map<String, serde_json::Value>> = serde_json::from_str(text).map_err(|e| format!("JSON de datos inválido: {e}"))?;
+        let rows: Vec<serde_json::Map<String, serde_json::Value>> = serde_json::from_str(text).map_err(|e| tr!("JSON de datos inválido: {e}", "invalid data JSON: {e}"))?;
         return Ok(rows
             .into_iter()
             .map(|r| r.into_iter().map(|(k, v)| (k, v.as_str().map_or_else(|| v.to_string(), String::from))).collect())
@@ -73,7 +79,7 @@ pub fn parse_data(text: &str) -> Result<Vec<Vars>, String> {
     let first = text.lines().next().unwrap_or("");
     let sep = if first.contains(';') && !first.contains(',') { ';' } else { ',' };
     let mut rows = csv_rows(text, sep).into_iter();
-    let header = rows.next().ok_or("el archivo de datos está vacío")?;
+    let header = rows.next().ok_or(t("el archivo de datos está vacío", "the data file is empty"))?;
     let header: Vec<String> = header.into_iter().map(|h| h.trim().to_string()).collect();
     Ok(rows
         .filter(|r| r.iter().any(|c| !c.is_empty()))
@@ -133,7 +139,7 @@ const MAX_STEPS_PER_ITERATION: usize = 10_000;
 
 /// Corre los requests en orden, `iterations` veces. Con `data`, cada iteración usa una fila (pm.iterationData
 /// y {{columna}}), repitiendo desde el inicio si hay más iteraciones que filas. Las variables que fijen los
-/// scripts pasan al siguiente request (como en Newman); las locales se limpian en cada uno.
+/// scripts pasan al siguiente request; las locales se limpian en cada uno.
 /// pm.setNextRequest(nombre) salta a ese request y pm.setNextRequest(null) termina la iteración.
 #[allow(clippy::too_many_arguments)]
 pub fn run_collection(
@@ -164,7 +170,7 @@ pub fn run_collection(
                 None => i + 1,
                 Some(None) => usize::MAX,
                 Some(Some(name)) => col.requests.iter().position(|q| q.name == name).unwrap_or_else(|| {
-                    step.tests.push(TestResult { name: "setNextRequest".into(), pass: false, error: Some(format!("no existe el request \"{name}\"")) });
+                    step.tests.push(TestResult { name: "setNextRequest".into(), pass: false, error: Some(tr!("no existe el request \"{name}\"", "the request \"{name}\" does not exist")) });
                     usize::MAX
                 }),
             };
@@ -172,7 +178,7 @@ pub fn run_collection(
                 step.tests.push(TestResult {
                     name: "setNextRequest".into(),
                     pass: false,
-                    error: Some(format!("más de {MAX_STEPS_PER_ITERATION} pasos en la iteración: ¿bucle infinito?")),
+                    error: Some(tr!("más de {MAX_STEPS_PER_ITERATION} pasos en la iteración: ¿bucle infinito?", "more than {MAX_STEPS_PER_ITERATION} steps in the iteration: infinite loop?")),
                 });
                 i = usize::MAX;
             }
@@ -217,63 +223,6 @@ pub fn junit(suite: &str, steps: &[Step]) -> String {
         x += "  </testsuite>\n";
     }
     x + "</testsuites>\n"
-}
-
-// ---- Estrés ----
-
-/// Una etapa: `vus` usuarios virtuales en paralelo durante `secs` segundos, sin pausa entre requests.
-/// Con `ramp`, los usuarios suben (o bajan) en línea recta desde los de la etapa anterior (1 si es la primera).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Stage {
-    pub vus: u32,
-    pub secs: u64,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub ramp: bool,
-}
-
-impl Stage {
-    /// Usuarios activos a los `t` segundos de la etapa.
-    pub fn vus_at(&self, from: u32, t: f64) -> u32 {
-        if !self.ramp {
-            return self.vus;
-        }
-        let k = (t / self.secs.max(1) as f64).clamp(0.0, 1.0);
-        ((from as f64 + (self.vus as f64 - from as f64) * k).round() as u32).max(1)
-    }
-
-    pub fn label(&self) -> String {
-        if self.ramp { format!("rampa→{} VUs·{} s", self.vus, self.secs) } else { format!("{} VUs·{} s", self.vus, self.secs) }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Battery {
-    pub name: String,
-    pub description: String,
-    pub stages: Vec<Stage>,
-}
-
-pub const MAX_VUS: u32 = 500;
-
-pub fn default_batteries() -> Vec<Battery> {
-    // (vus, segundos, rampa)
-    let b = |name: &str, description: &str, stages: &[(u32, u64, bool)]| Battery {
-        name: name.into(),
-        description: description.into(),
-        stages: stages.iter().map(|&(vus, secs, ramp)| Stage { vus, secs, ramp }).collect(),
-    };
-    vec![
-        b("Humo", "1 usuario, 10 s: ¿responde y en cuánto?", &[(1, 10, false)]),
-        b("Carga", "Rampa a 10 usuarios y 60 s sostenidos: tráfico normal", &[(10, 15, true), (10, 60, false)]),
-        b(
-            "Estrés",
-            "Escalera con rampas 10→50→100 usuarios: ¿dónde se degrada?",
-            &[(10, 10, true), (10, 20, false), (50, 20, true), (50, 20, false), (100, 20, true), (100, 20, false)],
-        ),
-        b("Pico", "1→100→1 usuarios de golpe: ráfaga repentina y recuperación", &[(1, 10, false), (100, 15, false), (1, 10, false)]),
-        b("Rampa", "Sube de 1 a 100 usuarios en 2 min: encuentra el punto de quiebre", &[(100, 120, true)]),
-        b("Resistencia", "Rampa a 20 usuarios y 10 min sostenidos: fugas de memoria / conexiones", &[(20, 30, true), (20, 600, false)]),
-    ]
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -360,7 +309,7 @@ pub fn stress(
     on_progress: &mut dyn FnMut(&Progress),
 ) -> Result<Vec<StageReport>, String> {
     if targets.is_empty() || stages.is_empty() {
-        return Err("No hay endpoints o etapas que ejecutar".into());
+        return Err(t("No hay endpoints o etapas que ejecutar", "There are no endpoints or stages to run").into());
     }
     for s in setup {
         scopes.local.clear();
@@ -371,7 +320,7 @@ pub fn stress(
             Ok(_) => d.tests.iter().find(|t| !t.pass).map(|t| format!("{}: {}", t.name, t.error.clone().unwrap_or_default())),
         };
         if let Some(p) = problem {
-            return Err(format!("La preparación \"{}\" falló ({p}); no se ejecutó la batería", s.name));
+            return Err(tr!("La preparación \"{}\" falló ({p}); no se ejecutó la batería", "The setup \"{}\" failed ({p}); the battery did not run", s.name));
         }
         scopes = d.scopes;
     }
@@ -383,7 +332,7 @@ pub fn stress(
         scopes.local.clear();
         let d = run_send(client, t, scopes);
         if let Some(e) = d.tests.iter().find(|x| x.name == "Pre-request").and_then(|x| x.error.as_ref()) {
-            return Err(format!("Pre-request de \"{}\": {e}", t.name));
+            return Err(tr!("Pre-request de \"{}\": {e}", "Pre-request of \"{}\": {e}", t.name));
         }
         scopes = d.scopes;
         warm.push((d.req, scopes.local.clone()));
@@ -544,10 +493,10 @@ pub fn check_thresholds(reports: &[StageReport], max_p95: Option<u64>, max_error
     for (i, r) in reports.iter().enumerate() {
         for s in std::iter::once(&r.total).chain(&r.endpoints).filter(|s| s.count > 0) {
             if let Some(m) = max_p95.filter(|&m| s.p95 > m) {
-                v.push(format!("Etapa {} ({} VUs) · {}: p95 {} ms > {m} ms", i + 1, r.vus, s.name, s.p95));
+                v.push(tr!("Etapa {} ({} VUs) · {}: p95 {} ms > {m} ms", "Stage {} ({} VUs) · {}: p95 {} ms > {m} ms", i + 1, r.vus, s.name, s.p95));
             }
             if let Some(m) = max_error_pct.filter(|&m| s.error_pct > m) {
-                v.push(format!("Etapa {} ({} VUs) · {}: errores {:.2}% > {m}%", i + 1, r.vus, s.name, s.error_pct));
+                v.push(tr!("Etapa {} ({} VUs) · {}: errores {:.2}% > {m}%", "Stage {} ({} VUs) · {}: errors {:.2}% > {m}%", i + 1, r.vus, s.name, s.error_pct));
             }
         }
     }
@@ -615,7 +564,7 @@ mod tests {
         let mut scopes = Scopes { env: [("base".into(), base)].into(), ..Default::default() };
         let stop = AtomicBool::new(false);
         let mut seen = 0;
-        let steps = run_collection(&model::client(), &col, &mut scopes, 1, &[], true, &stop, &mut |_| seen += 1);
+        let steps = run_collection(&http::client(), &col, &mut scopes, 1, &[], true, &stop, &mut |_| seen += 1);
         assert_eq!((steps.len(), seen), (3, 3), "bail se detiene en el primer fallo");
         assert!(steps[0].passed() && steps[1].passed() && !steps[2].passed(), "{steps:?}");
         assert_eq!(scopes.env["tok"], "token123");
@@ -646,14 +595,14 @@ mod tests {
         assert_eq!(data[0]["user"], "ana; \"la jefa\"");
         let mut scopes = Scopes { env: [("base".into(), base)].into(), ..Default::default() };
         let stop = AtomicBool::new(false);
-        let steps = run_collection(&model::client(), &col, &mut scopes, 3, &data, false, &stop, &mut |_| {});
+        let steps = run_collection(&http::client(), &col, &mut scopes, 3, &data, false, &stop, &mut |_| {});
         let names: Vec<&str> = steps.iter().filter(|s| s.iteration == 1).map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["a", "polling", "polling", "polling", "fin"]);
         assert_eq!(steps.len(), 15);
         assert!(steps.iter().all(|s| s.passed()), "{steps:?}");
 
         let bad = Collection { requests: vec![req("x", "{{base}}/x", "pm.setNextRequest('no-existe')")], ..Default::default() };
-        let steps = run_collection(&model::client(), &bad, &mut scopes, 1, &[], false, &stop, &mut |_| {});
+        let steps = run_collection(&http::client(), &bad, &mut scopes, 1, &[], false, &stop, &mut |_| {});
         assert!(!steps[0].passed());
         assert_eq!(parse_data(r#"[{"id": 7, "n": "x"}]"#).unwrap()[0]["id"], "7");
     }
@@ -665,7 +614,7 @@ mod tests {
         let stop = AtomicBool::new(false);
         let mut ticks = 0;
         let stages = [Stage { vus: 4, secs: 1, ramp: false }, Stage { vus: 8, secs: 2, ramp: true }];
-        let r = stress(&model::client(), &[], &targets, Scopes::default(), &stages, &stop, &mut |_| ticks += 1).unwrap();
+        let r = stress(&http::client(), &[], &targets, Scopes::default(), &stages, &stop, &mut |_| ticks += 1).unwrap();
         let (t, ok, err) = (&r[0].total, &r[0].endpoints[0], &r[0].endpoints[1]);
         assert!(ticks > 0 && t.count > 10 && t.count == ok.count + err.count, "{t:?}");
         assert_eq!((ok.ok, err.ok, err.error_pct), (ok.count, 0, 100.0));
@@ -678,7 +627,7 @@ mod tests {
         assert_eq!((tl.len(), tl.iter().map(|b| b.count).sum::<usize>()), (2, r[1].total.count));
 
         let login = req("login", &format!("{base}/fail"), "");
-        let e = stress(&model::client(), &[login], &targets, Scopes::default(), &stages, &stop, &mut |_| {}).unwrap_err();
+        let e = stress(&http::client(), &[login], &targets, Scopes::default(), &stages, &stop, &mut |_| {}).unwrap_err();
         assert!(e.contains("login") && e.contains("500"), "{e}");
     }
 

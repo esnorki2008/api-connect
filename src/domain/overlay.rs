@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
-use crate::model::ReqParts;
+use crate::{domain::model::ReqParts, tr};
 
 type Flat = BTreeMap<Vec<String>, Value>;
 
@@ -262,7 +262,7 @@ pub fn validate(body: &str, schema: &Value) -> Vec<String> {
             out.sort();
             out
         }
-        Err(e) => vec![format!("body: no es JSON válido ({e})")],
+        Err(e) => vec![tr!("body: no es JSON válido ({e})", "body: not valid JSON ({e})")],
     }
 }
 
@@ -280,7 +280,7 @@ fn check(v: &Value, s: &Value, path: &str, out: &mut Vec<String>) {
     }
     if let Some(e) = s["enum"].as_array() {
         if !e.contains(v) {
-            out.push(format!("{path}: {} no está en {}", show(v), Value::Array(e.clone())));
+            out.push(tr!("{path}: {} no está en {}", "{path}: {} is not in {}", show(v), Value::Array(e.clone())));
         }
     }
     let ok = |t: &str| match t {
@@ -293,20 +293,20 @@ fn check(v: &Value, s: &Value, path: &str, out: &mut Vec<String>) {
         _ => true,
     };
     if !types.is_empty() && !types.iter().any(|t| ok(t)) {
-        out.push(format!("{path}: se esperaba {} y llegó {}", types.join("|"), show(v)));
+        out.push(tr!("{path}: se esperaba {} y llegó {}", "{path}: expected {} but got {}", types.join("|"), show(v)));
         return;
     }
     if let (Some(o), Some(props)) = (v.as_object(), s["properties"].as_object()) {
         for r in s["required"].as_array().into_iter().flatten().filter_map(Value::as_str) {
             if !o.contains_key(r) {
-                out.push(format!("{path}.{r}: es obligatorio y falta"));
+                out.push(tr!("{path}.{r}: es obligatorio y falta", "{path}.{r}: is required and missing"));
             }
         }
         for (k, x) in o {
             match props.get(k) {
                 Some(ps) => check(x, ps, &format!("{path}.{k}"), out),
                 None if s["additionalProperties"].is_object() || s["additionalProperties"] == true => {}
-                None => out.push(format!("{path}.{k}: fuera de contrato (no existe en el schema)")),
+                None => out.push(tr!("{path}.{k}: fuera de contrato (no existe en el schema)", "{path}.{k}: outside the contract (not in the schema)")),
             }
         }
     }

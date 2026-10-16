@@ -2,6 +2,8 @@
 name = "api-connect"
 version = "0.1.0"
 edition = "2024"
+description = "Cliente de APIs REST agentic first: lo usan igual de bien una persona y un agente de IA."
+repository = "https://github.com/esnorki2008/api-connect"
 
 [dependencies]
 eframe = "0.31"
@@ -21,3 +23,9 @@ ring = "0.17"
 name = "api-connect"
 path = "src/main.rs"
 test = false
+
+# Binarios de release más chicos y rápidos (más lento de compilar).
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

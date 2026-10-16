@@ -8,8 +8,10 @@ use std::{
 };
 
 use crate::{
-    import, openapi,
-    model::{Collection, Origin},
+    domain::model::{Collection, Origin},
+    i18n::t,
+    import::{openapi, postman},
+    tr,
 };
 
 pub const FOLDER: &str = "collections";
@@ -27,7 +29,7 @@ pub fn fetch_and_scan(cache: &Path, url: &str, branch: &str) -> Result<Scan, Str
     let (url, branch) = (url.trim(), branch.trim());
     // Un valor que empiece con "-" se colaría como opción de git.
     if url.is_empty() || url.starts_with('-') || branch.starts_with('-') {
-        return Err("URL o rama inválida".into());
+        return Err(t("URL o rama inválida", "invalid URL or branch").into());
     }
     let dir = cache_dir(cache, url);
     if dir.join(".git").exists() {
@@ -48,7 +50,7 @@ pub fn fetch_and_scan(cache: &Path, url: &str, branch: &str) -> Result<Scan, Str
 
     let root = dir.join(FOLDER);
     if !root.is_dir() {
-        return Err(format!("El repo no tiene la carpeta /{FOLDER} en la raíz (commit {commit})"));
+        return Err(tr!("El repo no tiene la carpeta /{FOLDER} en la raíz (commit {commit})", "The repo has no /{FOLDER} folder at its root (commit {commit})"));
     }
     let mut paths = Vec::new();
     walk(&root, &mut paths);
@@ -78,7 +80,7 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let out = cmd.output().map_err(|e| format!("no se pudo ejecutar git (¿está instalado?): {e}"))?;
+    let out = cmd.output().map_err(|e| tr!("no se pudo ejecutar git (¿está instalado?): {e}", "could not run git (is it installed?): {e}"))?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
@@ -100,20 +102,20 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
 /// OpenAPI (YAML/JSON) o colección de Postman -> colección con `origin` en cada request.
 pub fn load_file(path: &Path) -> Result<Collection, String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("colección");
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(t("colección", "collection"));
     let spec = openapi::parse(&text)?;
     if openapi::is_openapi(&spec) {
         return openapi::to_collection(&spec, stem);
     }
     if spec["info"].is_object() && spec["item"].is_array() {
-        let mut c = import::import_postman(&serde_json::to_string(&spec).unwrap_or_default())?;
+        let mut c = postman::import_postman(&serde_json::to_string(&spec).unwrap_or_default())?;
         // Postman no tiene una clave estable por endpoint: se usa el nombre (con carpeta).
         for r in &mut c.requests {
             r.origin = Some(Origin { key: r.name.clone(), base: r.parts(), schema: serde_json::Value::Null });
         }
         return Ok(c);
     }
-    Err("no es OpenAPI/Swagger ni colección de Postman".into())
+    Err(t("no es OpenAPI/Swagger ni colección de Postman", "not an OpenAPI/Swagger spec or a Postman collection").into())
 }
 
 #[derive(Default, Debug, PartialEq)]
@@ -130,8 +132,9 @@ pub struct Report {
 impl Report {
     pub fn summary(&self) -> String {
         let list = |v: &Vec<String>| if v.is_empty() { String::new() } else { format!(": {}", v.join(", ")) };
-        format!(
+        tr!(
             "{} nuevos{} · {} actualizados{} · {} fusionados con tus cambios{} · {} ya no están en el repo{}",
+            "{} new{} · {} updated{} · {} merged with your changes{} · {} no longer in the repo{}",
             self.added.len(),
             list(&self.added),
             self.updated.len(),
@@ -168,7 +171,7 @@ pub fn merge(local: &mut Collection, remote: Collection) -> Report {
                 let (list, parts) = if l.parts() == old.base {
                     (&mut report.updated, origin.base.clone())
                 } else {
-                    (&mut report.merged, crate::overlay::rebase(&old.base, &l.parts(), &origin.base))
+                    (&mut report.merged, crate::domain::overlay::rebase(&old.base, &l.parts(), &origin.base))
                 };
                 list.push(l.name.clone());
                 l.set_parts(parts);
@@ -191,7 +194,7 @@ pub fn merge(local: &mut Collection, remote: Collection) -> Report {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Request;
+    use crate::domain::model::Request;
 
     fn spec(get_url_suffix: &str, extra_path: &str) -> String {
         format!(

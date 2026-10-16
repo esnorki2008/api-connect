@@ -1,0 +1,49 @@
+# Al subir un tag vX.Y.Z, compila para Windows y Linux y publica los paquetes en GitHub Releases.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            target: windows-x64
+          - os: ubuntu-22.04
+            target: linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libssl-dev pkg-config
+      - run: cargo test --release --locked
+      - run: cargo build --release --locked
+
+      - name: Empaquetar (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "api-connect-${{ github.ref_name }}-${{ matrix.target }}"
+          New-Item -ItemType Directory "dist/$name" | Out-Null
+          Copy-Item target/release/api-connect.exe, target/release/api-connect-cli.exe, packaging/install.ps1, README.md, README.en.md "dist/$name"
+          Compress-Archive "dist/$name/*" "dist/$name.zip"
+
+      - name: Empaquetar (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          name="api-connect-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp target/release/api-connect target/release/api-connect-cli packaging/install.sh README.md README.en.md "dist/$name"
+          chmod +x "dist/$name/install.sh"
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: dist/*.${{ runner.os == 'Windows' && 'zip' || 'tar.gz' }}

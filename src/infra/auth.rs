@@ -11,13 +11,30 @@ use std::{
 use base64::{Engine, engine::general_purpose::STANDARD, engine::general_purpose::URL_SAFE_NO_PAD};
 use reqwest::blocking::Client;
 
-use crate::model::{self, Auth, OAuth2, ReqParts, Vars, parse_headers, resolve};
+use crate::{
+    domain::{
+        model::{Auth, OAuth2, ReqParts},
+        vars::{Vars, parse_headers, resolve},
+    },
+    i18n::t,
+    infra::http,
+    tr,
+};
 
 pub const GRANTS: [(&str, &str); 3] = [
     ("client_credentials", "Client credentials"),
     ("password", "Password"),
     ("authorization_code", "Authorization code (PKCE)"),
 ];
+
+/// Etiqueta de un grant de GRANTS en el idioma de la interfaz.
+pub fn grant_label(id: &str) -> &'static str {
+    match id {
+        "password" => t("Usuario y contraseña", "Password"),
+        "authorization_code" => t("Código de autorización (PKCE)", "Authorization code (PKCE)"),
+        _ => t("Credenciales de cliente", "Client credentials"),
+    }
+}
 
 pub const DEFAULT_CALLBACK: &str = "http://localhost:53682/callback";
 
@@ -61,7 +78,7 @@ pub fn apply(client: &Client, auth: &Auth, req: &mut ReqParts, vars: &Vars) -> R
         Auth::ApiKey { key, value, in_query } => {
             let (k, v) = (r(key), r(value));
             if k.trim().is_empty() {
-                return Err("API Key: falta el nombre de la clave".into());
+                return Err(t("API Key: falta el nombre de la clave", "API Key: the key name is missing").into());
             }
             if *in_query {
                 let enc = |s: &str| form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
@@ -109,7 +126,11 @@ pub fn token_for(client: &Client, o: &OAuth2, vars: &Vars) -> Result<Token, Stri
     } else {
         match o.grant.as_str() {
             "password" => request_token(client, o, vars, &[("grant_type", "password".into()), ("username", r(&o.username)), ("password", r(&o.password))]),
-            "authorization_code" => Err("OAuth 2.0: no hay token. Pulsa \"Obtener token\" en la pestaña Auth para iniciar sesión en el navegador.".into()),
+            "authorization_code" => Err(t(
+                "OAuth 2.0: no hay token. Pulsa \"Obtener token\" en la pestaña Auth para iniciar sesión en el navegador.",
+                "OAuth 2.0: no token yet. Click \"Get token\" in the Auth tab to sign in with the browser.",
+            )
+            .into()),
             _ => request_token(client, o, vars, &[("grant_type", "client_credentials".into())]),
         }
     }?;
@@ -124,7 +145,7 @@ fn request_token(client: &Client, o: &OAuth2, vars: &Vars, extra: &[(&str, Strin
     let r = |s: &str| resolve(s, vars);
     let url = r(&o.token_url);
     if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err(format!("OAuth 2.0: la URL del token no es válida: \"{url}\""));
+        return Err(tr!("OAuth 2.0: la URL del token no es válida: \"{url}\"", "OAuth 2.0: invalid token URL: \"{url}\""));
     }
     let mut form = form_urlencoded::Serializer::new(String::new());
     for (k, v) in extra {
@@ -136,15 +157,15 @@ fn request_token(client: &Client, o: &OAuth2, vars: &Vars, extra: &[(&str, Strin
         }
     }
     let headers = [("Content-Type".to_string(), "application/x-www-form-urlencoded".to_string()), ("Accept".into(), "application/json".into())];
-    let res = model::send_http(client, "POST", &url, &headers, &form.finish())?;
+    let res = http::send_http(client, "POST", &url, &headers, &form.finish())?;
     parse_token(res.status, &res.body)
 }
 
 fn parse_token(status: u16, body: &str) -> Result<Token, String> {
-    let v: serde_json::Value = serde_json::from_str(body).map_err(|_| format!("OAuth 2.0: respuesta {status} sin JSON: {}", body.chars().take(300).collect::<String>()))?;
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|_| tr!("OAuth 2.0: respuesta {status} sin JSON: {}", "OAuth 2.0: {status} response without JSON: {}", body.chars().take(300).collect::<String>()))?;
     let access = v["access_token"].as_str().unwrap_or_default().to_string();
     if access.is_empty() {
-        let err = [&v["error_description"], &v["error"]].iter().find_map(|x| x.as_str()).unwrap_or("sin access_token");
+        let err = [&v["error_description"], &v["error"]].iter().find_map(|x| x.as_str()).unwrap_or(t("sin access_token", "no access_token"));
         return Err(format!("OAuth 2.0 ({status}): {err}"));
     }
     let expires_in = v["expires_in"].as_u64().or_else(|| v["expires_in"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0);
@@ -170,7 +191,7 @@ pub fn fetch_token(client: &Client, o: &OAuth2, vars: &Vars) -> Result<Token, St
 fn random_b64(n: usize) -> Result<String, String> {
     use ring::rand::SecureRandom;
     let mut bytes = vec![0u8; n];
-    ring::rand::SystemRandom::new().fill(&mut bytes).map_err(|_| "no se pudo generar un valor aleatorio".to_string())?;
+    ring::rand::SystemRandom::new().fill(&mut bytes).map_err(|_| t("no se pudo generar un valor aleatorio", "could not generate a random value").to_string())?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
@@ -179,15 +200,15 @@ fn authorization_code(client: &Client, o: &OAuth2, vars: &Vars) -> Result<Token,
     let r = |s: &str| resolve(s, vars);
     let auth_url = r(&o.auth_url);
     if !auth_url.starts_with("https://") && !auth_url.starts_with("http://") {
-        return Err(format!("OAuth 2.0: la URL de autorización no es válida: \"{auth_url}\""));
+        return Err(tr!("OAuth 2.0: la URL de autorización no es válida: \"{auth_url}\"", "OAuth 2.0: invalid authorization URL: \"{auth_url}\""));
     }
     let callback = if o.callback_url.trim().is_empty() { DEFAULT_CALLBACK.to_string() } else { r(&o.callback_url) };
     let cb = reqwest::Url::parse(&callback).map_err(|e| format!("callback_url: {e}"))?;
     if !matches!(cb.host_str(), Some("localhost" | "127.0.0.1")) || cb.scheme() != "http" {
-        return Err("callback_url debe ser http://localhost:PUERTO/... (la app recibe ahí el código)".into());
+        return Err(t("callback_url debe ser http://localhost:PUERTO/... (la app recibe ahí el código)", "callback_url must be http://localhost:PORT/... (the app receives the code there)").into());
     }
     let port = cb.port_or_known_default().unwrap_or(80);
-    let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| format!("no se pudo escuchar en el puerto {port}: {e}"))?;
+    let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| tr!("no se pudo escuchar en el puerto {port}: {e}", "could not listen on port {port}: {e}"))?;
 
     let verifier = random_b64(32)?;
     let challenge = URL_SAFE_NO_PAD.encode(ring::digest::digest(&ring::digest::SHA256, verifier.as_bytes()));
@@ -215,13 +236,13 @@ fn authorization_code(client: &Client, o: &OAuth2, vars: &Vars) -> Result<Token,
 /// Navegador por defecto del sistema. Solo URLs http(s): nunca se le pasa otra cosa al sistema.
 fn open_browser(url: &str) -> Result<(), String> {
     if !url.starts_with("https://") && !url.starts_with("http://") {
-        return Err("URL no permitida".into());
+        return Err(t("URL no permitida", "URL not allowed").into());
     }
     #[cfg(windows)]
     let r = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn();
     #[cfg(not(windows))]
     let r = std::process::Command::new("xdg-open").arg(url).spawn();
-    r.map(|_| ()).map_err(|e| format!("no se pudo abrir el navegador: {e}"))
+    r.map(|_| ()).map_err(|e| tr!("no se pudo abrir el navegador: {e}", "could not open the browser: {e}"))
 }
 
 fn wait_for_code(listener: &TcpListener, state: &str) -> Result<String, String> {
@@ -240,21 +261,21 @@ fn wait_for_code(listener: &TcpListener, state: &str) -> Result<String, String> 
                     .map(|u| u.query_pairs().into_owned().collect())
                     .unwrap_or_default();
                 if !q.contains_key("code") && !q.contains_key("error") {
-                    respond(&mut s, "Esperando el inicio de sesión…");
+                    respond(&mut s, t("Esperando el inicio de sesión…", "Waiting for sign-in…"));
                     continue; // p. ej. /favicon.ico
                 }
                 let result = match (q.get("code"), q.get("error"), q.get("state")) {
-                    (_, Some(e), _) => Err(format!("el proveedor respondió: {e} {}", q.get("error_description").map(String::as_str).unwrap_or(""))),
-                    (Some(_), _, st) if st.map(String::as_str) != Some(state) => Err("state no coincide: se descartó la respuesta".into()),
+                    (_, Some(e), _) => Err(tr!("el proveedor respondió: {e} {}", "the provider replied: {e} {}", q.get("error_description").map(String::as_str).unwrap_or(""))),
+                    (Some(_), _, st) if st.map(String::as_str) != Some(state) => Err(t("state no coincide: se descartó la respuesta", "state mismatch: the response was discarded").into()),
                     (Some(c), _, _) => Ok(c.clone()),
-                    _ => Err("respuesta sin código".into()),
+                    _ => Err(t("respuesta sin código", "response without a code").into()),
                 };
-                respond(&mut s, if result.is_ok() { "Listo: ya puedes volver a api-connect." } else { "No se pudo iniciar sesión; revisa api-connect." });
+                respond(&mut s, if result.is_ok() { t("Listo: ya puedes volver a api-connect.", "Done: you can go back to api-connect.") } else { t("No se pudo iniciar sesión; revisa api-connect.", "Sign-in failed; check api-connect.") });
                 return result;
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if start.elapsed() > LOGIN_TIMEOUT {
-                    return Err("se agotó el tiempo esperando el inicio de sesión en el navegador".into());
+                    return Err(t("se agotó el tiempo esperando el inicio de sesión en el navegador", "timed out waiting for sign-in in the browser").into());
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -281,7 +302,7 @@ mod tests {
     #[test]
     fn applies_simple_auth() {
         let vars: Vars = [("t".into(), "abc".into()), ("u".into(), "ana".into())].into();
-        let c = model::client();
+        let c = http::client();
         let mut p = parts();
         apply(&c, &Auth::Bearer { token: "{{t}}".into() }, &mut p, &vars).unwrap();
         assert!(p.headers.ends_with("Authorization: Bearer abc"));
@@ -321,7 +342,7 @@ mod tests {
         });
         let o = OAuth2 { grant: "client_credentials".into(), token_url: format!("http://{addr}/token"), client_id: "{{cid}}".into(), ..Default::default() };
         let vars: Vars = [("cid".into(), "app".into())].into();
-        let c = model::client();
+        let c = http::client();
         let mut p = parts();
         apply(&c, &Auth::Oauth2(o.clone()), &mut p, &vars).unwrap();
         assert!(p.headers.ends_with("Authorization: Bearer tok-1"));

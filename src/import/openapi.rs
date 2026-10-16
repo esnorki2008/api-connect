@@ -3,13 +3,17 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::model::{Collection, Origin, Request, Vars};
+use crate::{
+    domain::model::{Collection, Origin, Request, Vars},
+    i18n::t,
+    tr,
+};
 
 const METHODS: [&str; 7] = ["get", "post", "put", "patch", "delete", "head", "options"];
 
 /// YAML es superconjunto de JSON: un solo parser sirve para los dos formatos.
 pub fn parse(text: &str) -> Result<Value, String> {
-    serde_yaml::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| format!("YAML/JSON inválido: {e}"))
+    serde_yaml::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| tr!("YAML/JSON inválido: {e}", "invalid YAML/JSON: {e}"))
 }
 
 pub fn is_openapi(v: &Value) -> bool {
@@ -17,7 +21,7 @@ pub fn is_openapi(v: &Value) -> bool {
 }
 
 pub fn to_collection(spec: &Value, fallback_name: &str) -> Result<Collection, String> {
-    let paths = spec["paths"].as_object().ok_or("El OpenAPI no tiene 'paths'")?;
+    let paths = spec["paths"].as_object().ok_or(t("El OpenAPI no tiene 'paths'", "The OpenAPI has no 'paths'"))?;
     let mut vars = Vars::new();
     vars.insert("baseUrl".into(), base_url(spec));
     let mut requests = Vec::new();
@@ -337,7 +341,7 @@ paths:
         assert!(!put.modified());
         let schema = &put.origin.as_ref().unwrap().schema;
         assert_eq!(schema["properties"]["name"]["type"], "string");
-        assert!(crate::overlay::validate(&put.body, schema).is_empty(), "el ejemplo generado cumple su propio schema");
+        assert!(crate::domain::overlay::validate(&put.body, schema).is_empty(), "el ejemplo generado cumple su propio schema");
     }
 
     #[test]

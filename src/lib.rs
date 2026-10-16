@@ -1,15 +1,11 @@
-//! Núcleo compartido por la app (api-connect.exe) y la consola (api-connect-cli.exe).
+//! Núcleo compartido por la app (api-connect) y la consola (api-connect-cli).
+//!
+//! Capas, de adentro hacia afuera (cada una solo usa las de adentro):
+//! `domain` → `engine` → `infra` / `import` → `ui`.
 
-pub mod actions;
-pub mod agent;
-pub mod auth;
-pub mod cookies;
+pub mod domain;
+pub mod engine;
+pub mod i18n;
 pub mod import;
-pub mod model;
-pub mod openapi;
-pub mod overlay;
-pub mod repo;
-pub mod runner;
-pub mod script;
-pub mod theme;
-pub mod widgets;
+pub mod infra;
+pub mod ui;
